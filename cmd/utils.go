@@ -496,7 +496,8 @@ func syncStackPRs(cfg *config.Config, s *stack.Stack) map[string]*github.PRDetai
 		pullRequest *stack.PullRequestRef
 		queued      bool
 		details     *github.PRDetails
-		skip        bool // true means keep existing data, don't update
+		headSHA     string // set only when the PR just resolved as merged
+		skip        bool   // true means keep existing data, don't update
 	}
 
 	results := make([]branchResult, len(s.Branches))
@@ -555,6 +556,9 @@ func syncStackPRs(cfg *config.Config, s *stack.Stack) map[string]*github.PRDetai
 					}
 					res.queued = pr.IsQueued()
 					res.details = prDetailsFromPR(pr)
+					if pr.Merged {
+						res.headSHA = pr.HeadRefOid
+					}
 					results[idx] = res
 					trackedResolved = true
 				}
@@ -606,6 +610,9 @@ func syncStackPRs(cfg *config.Config, s *stack.Stack) map[string]*github.PRDetai
 		if res.pullRequest != nil {
 			b.PullRequest = res.pullRequest
 			b.Queued = res.queued
+			if res.headSHA != "" {
+				b.Head = res.headSHA
+			}
 		} else if !b.IsMerged() {
 			// Clear if we didn't find anything (and original was cleared during discovery)
 			if b.PullRequest != nil && res.pullRequest == nil {
@@ -763,6 +770,11 @@ func syncStackPRsFromRemote(client github.ClientOps, s *stack.Stack) (map[string
 			Merged: pr.Merged,
 		}
 		b.Queued = pr.IsQueued()
+		if pr.Merged && pr.HeadRefOid != "" {
+			// The exact head commit merged on remote. Used to identify 
+			// and override a stale local branch ref.
+			b.Head = pr.HeadRefOid
+		}
 		details[b.Branch] = prDetailsFromPR(pr)
 	}
 
@@ -893,6 +905,10 @@ func fastForwardBranches(cfg *config.Config, s *stack.Stack, remote, currentBran
 func resolveOriginalRefs(s *stack.Stack) (map[string]string, error) {
 	branchNames := make([]string, 0, len(s.Branches))
 	for _, b := range s.Branches {
+		if b.IsMerged() && b.Head != "" {
+			// Already known from remote (see syncStackPRs).
+			continue
+		}
 		if b.IsMerged() && !git.BranchExists(b.Branch) {
 			continue
 		}
@@ -903,12 +919,11 @@ func resolveOriginalRefs(s *stack.Stack) (map[string]string, error) {
 		return nil, fmt.Errorf("resolving branch SHAs: %w", err)
 	}
 
-	// Backfill merged branches that were deleted locally.
+	// Backfill merged branches from the remote's synced head commit SHA 
+	// (b.Head), which takes precedence over the local branch ref. 
 	for _, b := range s.Branches {
-		if b.IsMerged() && !git.BranchExists(b.Branch) {
-			if b.Head != "" {
-				originalRefs[b.Branch] = b.Head
-			}
+		if b.IsMerged() && b.Head != "" {
+			originalRefs[b.Branch] = b.Head
 		}
 	}
 	return originalRefs, nil

@@ -683,6 +683,61 @@ func TestRebase_SkipsMergedBranches(t *testing.T) {
 	assert.Equal(t, "b2", rebaseCalls[0].branch)
 }
 
+// TestRebase_MergedBranch_PreferRemoteRef verifies the onto boundary 
+// uses the PR's remote head ref when the local branch ref is stale. 
+func TestRebase_MergedBranch_PreferRemoteRef(t *testing.T) {
+	s := stack.Stack{
+		Trunk: stack.BranchRef{Branch: "main"},
+		Branches: []stack.BranchRef{
+			{
+				Branch:      "b1",
+				Head:        "sha-b1-authoritative-merge-tip",
+				PullRequest: &stack.PullRequestRef{Number: 42, Merged: true},
+			},
+			{Branch: "b2"},
+		},
+	}
+
+	tmpDir := t.TempDir()
+	writeStackFile(t, tmpDir, s)
+
+	var rebaseCalls []rebaseCall
+
+	mock := newRebaseMock(tmpDir, "b2")
+
+	// b1's local branch still exists, but is stale.
+	mock.BranchExistsFn = func(name string) bool { return true }
+	mock.RevParseFn = func(ref string) (string, error) {
+		if ref == "b1" {
+			return "sha-b1-stale-local-ref", nil
+		}
+		if strings.HasPrefix(ref, "origin/") {
+			return "sha-" + strings.TrimPrefix(ref, "origin/"), nil
+		}
+		return "sha-" + ref, nil
+	}
+	mock.RebaseOntoFn = func(newBase, oldBase, branch string, opts git.RebaseOpts) error {
+		rebaseCalls = append(rebaseCalls, rebaseCall{newBase, oldBase, branch})
+		return nil
+	}
+
+	restore := git.SetOps(mock)
+	defer restore()
+
+	cfg, _, _ := config.NewTestConfig()
+	cmd := RebaseCmd(cfg)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	err := cmd.Execute()
+
+	assert.NoError(t, err)
+	require.Len(t, rebaseCalls, 1)
+	assert.Equal(t, "main", rebaseCalls[0].newBase)
+	assert.Equal(t, "sha-b1-authoritative-merge-tip", rebaseCalls[0].oldBase,
+		"must use b1's synced PR head, not its stale local branch ref, as the onto boundary for b2")
+	assert.Equal(t, "b2", rebaseCalls[0].branch)
+}
+
 // queuedPRClient returns a MockClient whose FindPRByNumber reports the given PR
 // numbers as queued (in a merge queue, open, not merged) and finds no PR by
 // branch name. Used to drive the transient Queued state through syncStackPRs in
