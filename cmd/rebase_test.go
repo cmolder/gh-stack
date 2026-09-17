@@ -857,6 +857,65 @@ func TestRebase_MergedBranch_PreferRemoteRef(t *testing.T) {
 	assert.Equal(t, "b2", rebaseCalls[0].branch)
 }
 
+// TestRebase_MergedBranch_PreferForkPoint checks that when the synced
+// PR head is no longer an ancestor of the branch above it, the old base
+// comes from git's fork point, not the possibly-stale recorded Base.
+func TestRebase_MergedBranch_PreferForkPoint(t *testing.T) {
+	s := stack.Stack{
+		Trunk: stack.BranchRef{Branch: "main"},
+		Branches: []stack.BranchRef{
+			{
+				Branch:      "b1",
+				Head:        "sha-b1-merge-tip",
+				PullRequest: &stack.PullRequestRef{Number: 42, Merged: true},
+			},
+			{Branch: "b2", Base: "sha-stale-recorded-base"},
+		},
+	}
+
+	tmpDir := t.TempDir()
+	writeStackFile(t, tmpDir, s)
+
+	var rebaseCalls []rebaseCall
+
+	mock := newRebaseMock(tmpDir, "b2")
+	mock.BranchExistsFn = func(name string) (bool, error) { return true, nil }
+
+	// b2 was manually rebased onto main outside gh-stack: b1's merge tip no
+	// longer precedes it, but the stale recorded base still technically does.
+	mock.IsAncestorFn = func(candidate, branch string) (bool, error) {
+		switch candidate {
+		case "sha-b1-merge-tip":
+			return false, nil
+		default:
+			return true, nil
+		}
+	}
+	mock.MergeBaseForkPointFn = func(ref, branch string) (string, error) {
+		return "sha-real-fork-point", nil
+	}
+	mock.RebaseOntoFn = func(newBase, oldBase, branch string, opts git.RebaseOpts) error {
+		rebaseCalls = append(rebaseCalls, rebaseCall{newBase, oldBase, branch})
+		return nil
+	}
+
+	restore := git.SetOps(mock)
+	defer restore()
+
+	cfg, _, _ := config.NewTestConfig()
+	cmd := RebaseCmd(cfg)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	err := cmd.Execute()
+
+	assert.NoError(t, err)
+	require.Len(t, rebaseCalls, 1)
+	assert.Equal(t, "sha-main", rebaseCalls[0].newBase)
+	assert.Equal(t, "sha-real-fork-point", rebaseCalls[0].oldBase,
+		"must ask git for the real fork point, not fall back to the stale recorded base")
+	assert.Equal(t, "b2", rebaseCalls[0].branch)
+}
+
 // queuedPRClient returns a MockClient whose FindPRByNumber reports the given PR
 // numbers as queued (in a merge queue, open, not merged) and finds no PR by
 // branch name. Used to drive the transient Queued state through syncStackPRs in
