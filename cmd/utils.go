@@ -771,7 +771,7 @@ func syncStackPRsFromRemote(client github.ClientOps, s *stack.Stack) (map[string
 		}
 		b.Queued = pr.IsQueued()
 		if pr.Merged && pr.HeadRefOid != "" {
-			// The exact head commit merged on remote. Used to identify 
+			// The exact head commit merged on remote. Used to identify
 			// and override a stale local branch ref.
 			b.Head = pr.HeadRefOid
 		}
@@ -919,8 +919,8 @@ func resolveOriginalRefs(s *stack.Stack) (map[string]string, error) {
 		return nil, fmt.Errorf("resolving branch SHAs: %w", err)
 	}
 
-	// Backfill merged branches from the remote's synced head commit SHA 
-	// (b.Head), which takes precedence over the local branch ref. 
+	// Backfill merged branches from the remote's synced head commit SHA
+	// (b.Head), which takes precedence over the local branch ref.
 	for _, b := range s.Branches {
 		if b.IsMerged() && b.Head != "" {
 			originalRefs[b.Branch] = b.Head
@@ -1109,11 +1109,15 @@ func resolveRebaseOldBase(currentParentTip, recordedBase, newBase, branch string
 	if isValid(currentParentTip) {
 		return currentParentTip, nil
 	}
-	if recordedBase != currentParentTip && isValid(recordedBase) {
-		return recordedBase, nil
-	}
+	// currentParentTip is stale (the branch moved past it, e.g. a manual
+	// rebase outside gh-stack). recordedBase is a cache from the same era
+	// and can be just as stale while still technically passing isValid, so
+	// ask git directly before falling back to it.
 	if forkPoint, err := git.MergeBaseForkPoint(newBase, branch); err == nil && isValid(forkPoint) {
 		return forkPoint, nil
+	}
+	if recordedBase != currentParentTip && isValid(recordedBase) {
+		return recordedBase, nil
 	}
 
 	return "", fmt.Errorf(
