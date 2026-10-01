@@ -1824,6 +1824,385 @@ func newPendingSubmitState(priorStackID string) *modify.StateFile {
 	}
 }
 
+func TestSubmit_PendingModifyCompletion(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		branches     int
+		newPR        bool
+		failure      string
+		priorDeleted bool
+	}{
+		{name: "one existing PR", branches: 1},
+		{name: "one new PR", branches: 1, newPR: true},
+		{name: "retry after old stack deletion", branches: 1, newPR: true, priorDeleted: true},
+		{name: "one PR failed push", branches: 1, failure: "push"},
+		{name: "one PR failed lookup", branches: 1, failure: "lookup"},
+		{name: "one PR failed creation", branches: 1, newPR: true, failure: "create"},
+		{name: "one PR invalid creation result", branches: 1, newPR: true, failure: "invalid-create"},
+		{name: "one PR failed base update", branches: 1, failure: "base"},
+		{name: "one PR failed auto-merge update", branches: 1, failure: "auto-merge"},
+		{name: "one PR failed ready update", branches: 1, failure: "ready"},
+		{name: "one PR failed catalog save", branches: 1, failure: "save"},
+		{name: "one PR lost during final refresh", branches: 1, failure: "refresh"},
+		{name: "multiple PRs complete", branches: 3},
+		{name: "multiple PRs failed lookup", branches: 3, failure: "lookup"},
+		{name: "multiple PRs failed creation", branches: 3, newPR: true, failure: "create"},
+		{name: "multiple PRs failed base update", branches: 3, failure: "base"},
+		{name: "multiple PRs failed stack creation", branches: 3, failure: "stack"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			s := stack.Stack{ID: "42", Number: 7, Trunk: stack.BranchRef{Branch: "main"}}
+			prs := make(map[string]*github.PullRequest)
+			oldNumbers := []int{99, 100}
+			target := fmt.Sprintf("b%d", tc.branches)
+			for i := 0; i < tc.branches; i++ {
+				name := fmt.Sprintf("b%d", i+1)
+				br := stack.BranchRef{Branch: name}
+				if !tc.newPR || name != target {
+					base := "main"
+					if i > 0 {
+						base = fmt.Sprintf("b%d", i)
+					}
+					if name == target {
+						base = "removed"
+					}
+					prs[name] = &github.PullRequest{
+						Number: 10 + i, ID: fmt.Sprintf("PR_%d", 10+i), State: "OPEN",
+						HeadRefName: name, BaseRefName: base,
+					}
+					if tc.failure == "auto-merge" && name == target {
+						prs[name].AutoMergeRequest = &github.AutoMergeRequest{EnabledAt: "2026-09-29T00:00:00Z"}
+					}
+					prs[name].IsDraft = tc.failure == "ready" && name == target
+					br.PullRequest = &stack.PullRequestRef{Number: 10 + i, ID: prs[name].ID}
+					oldNumbers = append(oldNumbers, 10+i)
+				}
+				s.Branches = append(s.Branches, br)
+			}
+			writeStackFile(t, dir, s)
+			pending := newPendingSubmitState("42")
+			if tc.priorDeleted {
+				pending.PriorRemoteStackID = ""
+			}
+			pending.RecordStack(&s)
+			saveModifyState(t, dir, pending)
+			mock := newSubmitMock(dir, "b1")
+			var pushes []string
+			mock.PushFn = func(_ string, branches []string, _, _ bool) error {
+				pushes = append(pushes, branches[0])
+				if tc.failure == "push" && branches[0] == target {
+					return assert.AnError
+				}
+				return nil
+			}
+			restore := git.SetOps(mock)
+			defer restore()
+			oldTimeout := stack.LockTimeout
+			stack.LockTimeout = 0
+			defer func() { stack.LockTimeout = oldTimeout }()
+			var catalogLock *stack.FileLock
+			defer func() {
+				if catalogLock != nil {
+					catalogLock.Unlock()
+				}
+			}()
+			oldDeleted := tc.priorDeleted
+			unstackCalls, createdPRs, baseUpdates := 0, 0, 0
+			var replacement *github.RemoteStack
+			client := &github.MockClient{
+				ListStacksFn: func() ([]github.RemoteStack, error) {
+					if !oldDeleted {
+						return []github.RemoteStack{{ID: 42, Number: 7, PullRequests: oldNumbers}}, nil
+					}
+					if replacement != nil {
+						return []github.RemoteStack{*replacement}, nil
+					}
+					return nil, nil
+				},
+				GetStackFn: func(number int) (*github.RemoteStack, error) {
+					if number == 7 && !oldDeleted {
+						return &github.RemoteStack{ID: 42, Number: 7, PullRequests: oldNumbers}, nil
+					}
+					if number == 8 && replacement != nil {
+						return replacement, nil
+					}
+					return nil, &api.HTTPError{StatusCode: 404}
+				},
+				FindPRByNumberFn: func(number int) (*github.PullRequest, error) {
+					if tc.failure == "refresh" && baseUpdates > 0 && number == prs[target].Number {
+						return nil, nil
+					}
+					for _, pr := range prs {
+						if pr.Number == number {
+							return pr, nil
+						}
+					}
+					return &github.PullRequest{Number: number, HeadRefName: fmt.Sprintf("removed-%d", number), State: "OPEN"}, nil
+				},
+				FindPRForBranchFn: func(branch string) (*github.PullRequest, error) {
+					if branch == target && (tc.failure == "lookup" || (tc.failure == "refresh" && baseUpdates > 0)) {
+						return nil, assert.AnError
+					}
+					return prs[branch], nil
+				},
+				UnstackFn: func(number int) (*github.RemoteStack, bool, error) {
+					require.Equal(t, 7, number)
+					unstackCalls++
+					oldDeleted = true
+					return nil, true, nil
+				},
+				CreatePRFn: func(base, head, _, _ string, _ bool) (*github.PullRequest, error) {
+					createdPRs++
+					if tc.failure == "create" {
+						return nil, assert.AnError
+					}
+					if tc.failure == "invalid-create" {
+						return nil, nil
+					}
+					pr := &github.PullRequest{Number: 50, ID: "PR_50", HeadRefName: head, BaseRefName: base, State: "OPEN"}
+					prs[head] = pr
+					return pr, nil
+				},
+				UpdatePRBaseFn: func(number int, base string) error {
+					baseUpdates++
+					if tc.failure == "base" {
+						return assert.AnError
+					}
+					require.Equal(t, prs[target].Number, number)
+					prs[target].BaseRefName = base
+					if tc.failure == "save" {
+						var err error
+						catalogLock, err = stack.Lock(dir)
+						require.NoError(t, err)
+					}
+					return nil
+				},
+				DisableAutoMergeFn:     func(string) error { return assert.AnError },
+				MarkPRReadyForReviewFn: func(string) error { return assert.AnError },
+				CreateStackFn: func(numbers []int) (*github.RemoteStack, error) {
+					require.GreaterOrEqual(t, len(numbers), 2)
+					if tc.failure == "stack" {
+						return nil, assert.AnError
+					}
+					replacement = &github.RemoteStack{ID: 77, Number: 8, PullRequests: numbers}
+					return replacement, nil
+				},
+			}
+			cfg, outR, errR := config.NewTestConfig()
+			cfg.GitHubClientOverride = client
+
+			err := runSubmit(cfg, &submitOptions{auto: true, open: tc.failure == "ready"})
+
+			_, output := commandOutput(t, cfg, outR, errR)
+			if tc.failure != "" {
+				assert.Error(t, err, output)
+				assert.FileExists(t, modify.StatePath(dir))
+				retained, loadErr := modify.LoadState(dir)
+				require.NoError(t, loadErr)
+				require.NotNil(t, retained)
+				assert.Equal(t, modify.PhasePendingSubmit, retained.Phase)
+				assert.NotContains(t, output, "Stack recreated")
+				assert.NotContains(t, output, "Changes from modify submitted")
+				assert.Nil(t, replacement, "an incomplete modification must not create a partial replacement stack")
+			} else {
+				require.NoError(t, err, output)
+				assert.NoFileExists(t, modify.StatePath(dir))
+				assert.Len(t, pushes, tc.branches)
+				saved, loadErr := stack.Load(dir)
+				require.NoError(t, loadErr)
+				require.NotNil(t, saved.Stacks[0].Branches[tc.branches-1].PullRequest)
+				assert.Equal(t, prs[target].Number, saved.Stacks[0].Branches[tc.branches-1].PullRequest.Number)
+				if tc.branches == 1 {
+					assert.Empty(t, saved.Stacks[0].ID)
+					assert.Nil(t, replacement)
+					assert.NotContains(t, output, "Stack recreated")
+				}
+				assert.Contains(t, output, "Changes from modify submitted")
+				if tc.newPR {
+					assert.Equal(t, 1, createdPRs)
+				} else {
+					assert.Equal(t, 1, baseUpdates)
+				}
+			}
+			if tc.priorDeleted {
+				assert.Zero(t, unstackCalls)
+			} else {
+				assert.Equal(t, 1, unstackCalls)
+			}
+		})
+	}
+}
+
+func TestSubmit_PRFailureWithoutPendingModifyRemainsBestEffort(t *testing.T) {
+	dir := t.TempDir()
+	writeStackFile(t, dir, stack.Stack{
+		Trunk: stack.BranchRef{Branch: "main"}, Branches: []stack.BranchRef{{Branch: "b1"}, {Branch: "b2"}},
+	})
+	mock := newSubmitMock(dir, "b1")
+	pushes := 0
+	mock.PushFn = func(string, []string, bool, bool) error { pushes++; return nil }
+	restore := git.SetOps(mock)
+	defer restore()
+	cfg, outR, errR := config.NewTestConfig()
+	creations := 0
+	cfg.GitHubClientOverride = &github.MockClient{
+		CreatePRFn: func(_, head, _, _ string, _ bool) (*github.PullRequest, error) {
+			creations++
+			if head == "b2" {
+				return nil, assert.AnError
+			}
+			return &github.PullRequest{Number: 10, ID: "PR_10", HeadRefName: head}, nil
+		},
+	}
+
+	require.NoError(t, runSubmit(cfg, &submitOptions{auto: true}))
+
+	_, output := commandOutput(t, cfg, outR, errR)
+	assert.Equal(t, 2, pushes)
+	assert.Equal(t, 2, creations)
+	assert.Contains(t, output, "failed to create PR for b2")
+	assert.NoFileExists(t, modify.StatePath(dir))
+}
+
+func TestPendingModify_UnrelatedStackRemainsUntouched(t *testing.T) {
+	dir := t.TempDir()
+	pending := newPendingSubmitState("123")
+	saveModifyState(t, dir, pending)
+	s := &stack.Stack{ID: "456", Trunk: stack.BranchRef{Branch: "main"}, Branches: []stack.BranchRef{{Branch: "other"}}}
+	cfg, outR, errR := config.NewTestConfig()
+	client := &github.MockClient{
+		UnstackFn: func(int) (*github.RemoteStack, bool, error) {
+			t.Fatal("must never unstack another stack's pending modification")
+			return nil, false, nil
+		},
+	}
+	handled, err := handlePendingModify(cfg, client, s, dir)
+	require.NoError(t, err)
+	assert.False(t, handled)
+	require.NoError(t, clearPendingModifyState(cfg, s, dir))
+	after, err := modify.LoadState(dir)
+	require.NoError(t, err)
+	assert.Equal(t, pending, after)
+	assert.Equal(t, "456", s.ID)
+	out, diagnostics := commandOutput(t, cfg, outR, errR)
+	assert.Empty(t, out)
+	assert.NotContains(t, diagnostics, "recreated")
+}
+
+func TestPendingModify_CorruptStateFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(modify.StatePath(dir), []byte("{"), 0600))
+	s := &stack.Stack{ID: "123"}
+	cfg, outR, errR := config.NewTestConfig()
+	handled, err := handlePendingModify(cfg, &github.MockClient{}, s, dir)
+	assert.ErrorIs(t, err, ErrModifyRecovery)
+	assert.False(t, handled)
+	assert.ErrorIs(t, clearPendingModifyState(cfg, s, dir), ErrModifyRecovery)
+	assert.FileExists(t, modify.StatePath(dir))
+	out, _ := commandOutput(t, cfg, outR, errR)
+	assert.Empty(t, out)
+}
+
+func TestPendingModify_RetryAfterOldStackDeletion(t *testing.T) {
+	dir := t.TempDir()
+	s := &stack.Stack{ID: "123", Number: 7, Trunk: stack.BranchRef{Branch: "main"}, Branches: []stack.BranchRef{{Branch: "b1"}}}
+	state := newPendingSubmitState("")
+	state.RecordStack(s)
+	saveModifyState(t, dir, state)
+	cfg, outR, errR := config.NewTestConfig()
+	client := &github.MockClient{
+		UnstackFn: func(int) (*github.RemoteStack, bool, error) {
+			t.Fatal("the old stack was already deleted")
+			return nil, false, nil
+		},
+	}
+	handled, err := handlePendingModify(cfg, client, s, dir)
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Empty(t, s.ID, "the catalog can still hold the old ID on a retry")
+	assert.Zero(t, s.Number)
+	s.ID, s.Number = "456", 8
+	require.NoError(t, clearPendingModifyState(cfg, s, dir))
+	assert.NoFileExists(t, modify.StatePath(dir))
+	commandOutput(t, cfg, outR, errR)
+}
+
+func TestPendingModify_PartialUnstackPreservesState(t *testing.T) {
+	dir := t.TempDir()
+	saveModifyState(t, dir, newPendingSubmitState("123"))
+	s := &stack.Stack{ID: "123", Number: 7}
+	cfg, outR, errR := config.NewTestConfig()
+	client := &github.MockClient{
+		ListStacksFn: func() ([]github.RemoteStack, error) {
+			return []github.RemoteStack{{ID: 123, Number: 7}}, nil
+		},
+		UnstackFn: func(int) (*github.RemoteStack, bool, error) { return nil, false, nil },
+	}
+	handled, err := handlePendingModify(cfg, client, s, dir)
+	assert.ErrorIs(t, err, ErrConflict)
+	assert.True(t, handled)
+	assert.Equal(t, "123", s.ID)
+	assert.Equal(t, 7, s.Number)
+	state, err := modify.LoadState(dir)
+	require.NoError(t, err)
+	require.NotNil(t, state)
+	assert.Equal(t, "123", state.PriorRemoteStackID)
+	commandOutput(t, cfg, outR, errR)
+}
+
+func TestSubmit_UnrelatedPendingModifyIsPreserved(t *testing.T) {
+	dir := t.TempDir()
+	s := stack.Stack{
+		ID: "456", Number: 8, Trunk: stack.BranchRef{Branch: "main"},
+		Branches: []stack.BranchRef{
+			{Branch: "b1", PullRequest: &stack.PullRequestRef{Number: 10}},
+			{Branch: "b2", PullRequest: &stack.PullRequestRef{Number: 11}},
+		},
+	}
+	writeStackFile(t, dir, s)
+	saveModifyState(t, dir, newPendingSubmitState("123"))
+	before, err := os.ReadFile(modify.StatePath(dir))
+	require.NoError(t, err)
+	restore := git.SetOps(newSubmitMock(dir, "b1"))
+	defer restore()
+	cfg, outR, errR := config.NewTestConfig()
+	prs := map[int]*github.PullRequest{
+		10: {Number: 10, State: "OPEN", HeadRefName: "b1", BaseRefName: "main"},
+		11: {Number: 11, State: "OPEN", HeadRefName: "b2", BaseRefName: "b1"},
+	}
+	cfg.GitHubClientOverride = &github.MockClient{
+		ListStacksFn: func() ([]github.RemoteStack, error) {
+			return []github.RemoteStack{{ID: 456, Number: 8, PullRequests: []int{10, 11}}}, nil
+		},
+		GetStackFn: func(int) (*github.RemoteStack, error) {
+			return &github.RemoteStack{ID: 456, Number: 8, PullRequests: []int{10, 11}}, nil
+		},
+		FindPRByNumberFn: func(number int) (*github.PullRequest, error) {
+			return prs[number], nil
+		},
+		FindPRForBranchFn: func(branch string) (*github.PullRequest, error) {
+			for _, pr := range prs {
+				if pr.HeadRefName == branch {
+					return pr, nil
+				}
+			}
+			return nil, nil
+		},
+		UnstackFn: func(int) (*github.RemoteStack, bool, error) {
+			t.Fatal("submitting another stack must not consume pending modification")
+			return nil, false, nil
+		},
+	}
+	require.NoError(t, runSubmit(cfg, &submitOptions{auto: true}))
+	after, err := os.ReadFile(modify.StatePath(dir))
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
+	out, diagnostics := commandOutput(t, cfg, outR, errR)
+	assert.Empty(t, out)
+	assert.NotContains(t, diagnostics, "recreated")
+}
+
 func TestHandlePendingModify_DeletesOldStack(t *testing.T) {
 	gitDir := t.TempDir()
 
@@ -1846,8 +2225,9 @@ func TestHandlePendingModify_DeletesOldStack(t *testing.T) {
 	defer cfg.Out.Close()
 	defer cfg.Err.Close()
 
-	err := handlePendingModify(cfg, client, s, gitDir)
+	handled, err := handlePendingModify(cfg, client, s, gitDir)
 	require.NoError(t, err)
+	assert.True(t, handled)
 	assert.Equal(t, 42, unstackedNumber)
 	assert.Equal(t, "", s.ID)
 }
@@ -1870,8 +2250,9 @@ func TestHandlePendingModify_NoStateFile(t *testing.T) {
 	defer cfg.Out.Close()
 	defer cfg.Err.Close()
 
-	err := handlePendingModify(cfg, client, s, gitDir)
+	handled, err := handlePendingModify(cfg, client, s, gitDir)
 	assert.NoError(t, err)
+	assert.False(t, handled)
 	assert.False(t, deleteCalled, "Unstack should not be called when no state file exists")
 	assert.Equal(t, "stack-123", s.ID, "stack ID should remain unchanged")
 }
@@ -1900,8 +2281,9 @@ func TestHandlePendingModify_WrongPhase(t *testing.T) {
 	defer cfg.Out.Close()
 	defer cfg.Err.Close()
 
-	err := handlePendingModify(cfg, client, s, gitDir)
-	assert.NoError(t, err)
+	handled, err := handlePendingModify(cfg, client, s, gitDir)
+	assert.ErrorIs(t, err, ErrModifyRecovery)
+	assert.False(t, handled)
 	assert.False(t, deleteCalled, "Unstack should not be called for non-pending_submit phase")
 	assert.Equal(t, "stack-99", s.ID, "stack ID should remain unchanged")
 }
@@ -1926,8 +2308,9 @@ func TestHandlePendingModify_DeleteFails(t *testing.T) {
 	defer cfg.Out.Close()
 	defer cfg.Err.Close()
 
-	err := handlePendingModify(cfg, client, s, gitDir)
+	handled, err := handlePendingModify(cfg, client, s, gitDir)
 	assert.Error(t, err)
+	assert.True(t, handled)
 	assert.Equal(t, "456", s.ID, "stack ID should NOT be cleared on delete failure")
 }
 
@@ -1955,8 +2338,9 @@ func TestHandlePendingModify_Delete404(t *testing.T) {
 	defer cfg.Out.Close()
 	defer cfg.Err.Close()
 
-	err := handlePendingModify(cfg, client, s, gitDir)
+	handled, err := handlePendingModify(cfg, client, s, gitDir)
 	require.NoError(t, err, "404 should be treated as success (stack already deleted)")
+	assert.True(t, handled)
 	assert.Equal(t, "", s.ID, "stack ID should be cleared after 404")
 }
 
@@ -1970,7 +2354,7 @@ func TestClearPendingModifyState_ClearsFile(t *testing.T) {
 	defer cfg.Out.Close()
 	defer cfg.Err.Close()
 
-	clearPendingModifyState(cfg, gitDir)
+	require.NoError(t, clearPendingModifyState(cfg, &stack.Stack{ID: "stack-789"}, gitDir))
 	assert.False(t, modify.StateExists(gitDir), "state file should be removed")
 }
 
@@ -1983,7 +2367,7 @@ func TestClearPendingModifyState_NoFile(t *testing.T) {
 	defer cfg.Err.Close()
 
 	// Should not panic or error.
-	clearPendingModifyState(cfg, gitDir)
+	require.NoError(t, clearPendingModifyState(cfg, &stack.Stack{}, gitDir))
 	assert.False(t, modify.StateExists(gitDir))
 }
 
@@ -2585,7 +2969,30 @@ func TestEnsurePR_DeselectedNewBranchSkipsCreate(t *testing.T) {
 		"b1": {Branch: "b1", Include: false},
 	}
 
-	err := ensurePR(cfg, client, s, 0, "main", &submitOptions{}, "", drafts)
+	submitted, err := ensurePR(cfg, client, s, 0, "main", &submitOptions{}, "", drafts)
 	require.NoError(t, err)
+	assert.False(t, submitted)
 	assert.Nil(t, s.Branches[0].PullRequest, "no PR should be recorded for a deselected branch")
+}
+
+func TestEnsurePR_DeselectedMissingPRIsIncompleteWithCachedAssociation(t *testing.T) {
+	s := &stack.Stack{
+		Trunk:    stack.BranchRef{Branch: "main"},
+		Branches: []stack.BranchRef{{Branch: "b1", PullRequest: &stack.PullRequestRef{Number: 10}}},
+	}
+	cfg, outR, errR := config.NewTestConfig()
+	client := &github.MockClient{
+		FindPRForBranchFn: func(string) (*github.PullRequest, error) { return nil, nil },
+		CreatePRFn: func(string, string, string, string, bool) (*github.PullRequest, error) {
+			t.Fatal("a deselected branch must not create a PR")
+			return nil, nil
+		},
+	}
+	drafts := map[string]*submitview.PRDraft{"b1": {Branch: "b1", Include: false}}
+
+	submitted, err := ensurePR(cfg, client, s, 0, "main", &submitOptions{}, "", drafts)
+
+	require.NoError(t, err)
+	assert.False(t, submitted, "a cached PR count must not turn a deselected missing PR into success")
+	commandOutput(t, cfg, outR, errR)
 }
