@@ -7,9 +7,13 @@ import "fmt"
 // Ops method call. When nil, a reasonable default is returned.
 type MockOps struct {
 	GitDirFn                 func() (string, error)
+	CommonDirFn              func() (string, error)
+	WorktreesFn              func() ([]Worktree, error)
+	ForWorktreeFn            func(string) (Ops, error)
+	CheckVersionFn           func() error
 	RootDirFn                func() (string, error)
 	CurrentBranchFn          func() (string, error)
-	BranchExistsFn           func(string) bool
+	BranchExistsFn           func(string) (bool, error)
 	CheckoutBranchFn         func(string) error
 	FetchFn                  func(string) error
 	FetchBranchFn            func(string, string) error
@@ -29,7 +33,7 @@ type MockOps struct {
 	RebaseOntoFn             func(string, string, string, RebaseOpts) error
 	RebaseContinueFn         func(RebaseOpts) error
 	RebaseAbortFn            func() error
-	IsRebaseInProgressFn     func() bool
+	IsRebaseInProgressFn     func() (bool, error)
 	ConflictedFilesFn        func() ([]string, error)
 	FindConflictMarkersFn    func(string) (*ConflictMarkerInfo, error)
 	IsAncestorFn             func(string, string) (bool, error)
@@ -51,7 +55,7 @@ type MockOps struct {
 	UpdateBranchRefFn        func(string, string) error
 	StageAllFn               func() error
 	StageTrackedFn           func() error
-	HasStagedChangesFn       func() bool
+	HasStagedChangesFn       func() (bool, error)
 	CommitFn                 func(string) (string, error)
 	CommitInteractiveFn      func() (string, error)
 	ValidateRefNameFn        func(string) error
@@ -60,7 +64,7 @@ type MockOps struct {
 	CherryPickQuitFn         func() error
 	CherryPickAbortFn        func() error
 	CherryPickContinueFn     func() error
-	IsCherryPickInProgressFn func() bool
+	IsCherryPickInProgressFn func() (bool, error)
 	HasUncommittedChangesFn  func() (bool, error)
 	LogMergesFn              func(string, string) ([]CommitInfo, error)
 }
@@ -72,6 +76,34 @@ func (m *MockOps) GitDir() (string, error) {
 		return m.GitDirFn()
 	}
 	return "/tmp/fake-git-dir", nil
+}
+
+func (m *MockOps) CommonDir() (string, error) {
+	if m.CommonDirFn != nil {
+		return m.CommonDirFn()
+	}
+	return m.GitDir()
+}
+
+func (m *MockOps) Worktrees() ([]Worktree, error) {
+	if m.WorktreesFn != nil {
+		return m.WorktreesFn()
+	}
+	return nil, nil
+}
+
+func (m *MockOps) ForWorktree(path string) (Ops, error) {
+	if m.ForWorktreeFn != nil {
+		return m.ForWorktreeFn(path)
+	}
+	return m, nil
+}
+
+func (m *MockOps) CheckVersion() error {
+	if m.CheckVersionFn != nil {
+		return m.CheckVersionFn()
+	}
+	return nil
 }
 
 func (m *MockOps) RootDir() (string, error) {
@@ -88,11 +120,11 @@ func (m *MockOps) CurrentBranch() (string, error) {
 	return "main", nil
 }
 
-func (m *MockOps) BranchExists(name string) bool {
+func (m *MockOps) BranchExists(name string) (bool, error) {
 	if m.BranchExistsFn != nil {
 		return m.BranchExistsFn(name)
 	}
-	return false
+	return false, nil
 }
 
 func (m *MockOps) CheckoutBranch(name string) error {
@@ -228,11 +260,11 @@ func (m *MockOps) RebaseAbort() error {
 	return nil
 }
 
-func (m *MockOps) IsRebaseInProgress() bool {
+func (m *MockOps) IsRebaseInProgress() (bool, error) {
 	if m.IsRebaseInProgressFn != nil {
 		return m.IsRebaseInProgressFn()
 	}
-	return false
+	return false, nil
 }
 
 func (m *MockOps) ConflictedFiles() ([]string, error) {
@@ -391,11 +423,11 @@ func (m *MockOps) StageTracked() error {
 	return nil
 }
 
-func (m *MockOps) HasStagedChanges() bool {
+func (m *MockOps) HasStagedChanges() (bool, error) {
 	if m.HasStagedChangesFn != nil {
 		return m.HasStagedChangesFn()
 	}
-	return false
+	return false, nil
 }
 
 func (m *MockOps) Commit(message string) (string, error) {
@@ -447,11 +479,11 @@ func (m *MockOps) CherryPickAbort() error {
 	return nil
 }
 
-func (m *MockOps) IsCherryPickInProgress() bool {
+func (m *MockOps) IsCherryPickInProgress() (bool, error) {
 	if m.IsCherryPickInProgressFn != nil {
 		return m.IsCherryPickInProgressFn()
 	}
-	return false
+	return false, nil
 }
 
 func (m *MockOps) CherryPickContinue() error {
