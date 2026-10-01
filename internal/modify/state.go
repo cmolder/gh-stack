@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/github/gh-stack/internal/stack"
 )
 
 const stateFileName = "gh-stack-modify-state"
@@ -75,7 +77,7 @@ func StatePath(gitDir string) string {
 // LoadState reads the modify state file from the git directory.
 // Returns nil, nil if the file does not exist.
 func LoadState(gitDir string) (*StateFile, error) {
-	data, err := os.ReadFile(StatePath(gitDir))
+	data, err := stack.ReadStateFile(StatePath(gitDir))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
@@ -96,17 +98,8 @@ func SaveState(gitDir string, state *StateFile) error {
 	if err != nil {
 		return fmt.Errorf("marshaling modify state: %w", err)
 	}
-	target := StatePath(gitDir)
-	tmp := target + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
+	if err := stack.WriteAtomic(StatePath(gitDir), data); err != nil {
 		return fmt.Errorf("writing modify state: %w", err)
-	}
-	// Remove existing target before rename for Windows compatibility
-	// (os.Rename fails on Windows if the target already exists).
-	_ = os.Remove(target)
-	if err := os.Rename(tmp, target); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("committing modify state: %w", err)
 	}
 	return nil
 }
