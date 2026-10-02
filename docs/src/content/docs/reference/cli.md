@@ -23,6 +23,45 @@ All linked worktrees share `<common-dir>/gh-stack` and gh-stack recovery journal
 
 For repositories created with `git init --separate-git-dir`, main-worktree invocation and existing absolute/relative `core.worktree` backlinks are supported, including settings in the main `config.worktree`. The discovery limitation is only linked invocation without a main-worktree backlink. If the operation requires that main owner, it fails with actionable guidance; unaffected worktrees continue. Administration directories are never used as checkout destinations.
 
+### Updating
+
+```sh
+gh extension upgrade stack
+```
+
+Official, unpinned stable release installations check the
+[latest gh-stack release](https://github.com/github/gh-stack/releases/latest)
+in the background, caching successful checks for 24 hours. Commands can append an
+upgrade notice to stderr after success or an operational failure, also at most once every
+24 hours, until you upgrade. On failure, the original error appears first and the
+exit code is unchanged.
+The timestamps are stored per user and shared across repositories, independently
+of GitHub CLI's own update checks.
+The YAML state file is `gh-stack/state.yml` beneath GitHub CLI's state directory:
+`~/.local/state/gh/gh-stack/state.yml` by default on macOS/Linux, or
+`$XDG_STATE_HOME/gh/gh-stack/state.yml` when `XDG_STATE_HOME` is set.
+
+Notices also appear in non-interactive use, including CI. Stdout and JSON output
+remain unchanged. No upgrade happens automatically, and commands never wait for
+the check: a short command may finish before a notice is ready. Completed checks
+are cached for later commands; failed or interrupted attempts can retry after a
+15-minute cooldown instead of waiting a full day.
+
+Development builds, locally linked installations, prereleases, and pinned
+installations are excluded. Help, version, and shell completion commands do not
+run the notifier. Users must first install a release containing this feature to
+receive notices about subsequent releases.
+Usage errors and explicit user cancellations do not show upgrade notices.
+
+To disable the notifier, including its network checks:
+
+```sh
+GH_STACK_NO_UPDATE_NOTIFIER=1 gh stack view
+```
+
+Any non-empty value disables it. Update-check failures never change the command's
+exit code; use `GH_DEBUG=1` to see diagnostic errors when a check completes.
+
 ---
 
 ## Stack Management
@@ -695,6 +734,7 @@ gh stack feedback "Support for reordering branches"
 |----------|--------|-------------|
 | `GH_STACK_THEME` | `auto` (default), `light`, `dark` | Controls the color palette of the interactive screens (`submit`, `modify`, `view`) and all colored command output. Colors adapt to your terminal background automatically; set this to force the light or dark palette when a terminal doesn't report its background (some SSH or `tmux` setups). |
 | `GH_STACK_HYPERLINKS` | `0`, `1` | Disables or enables OSC 8 hyperlinks when terminal detection is incorrect. Unsupported terminals show the full URL by default. |
+| `GH_STACK_NO_UPDATE_NOTIFIER` | Any non-empty value | Disables gh-stack's background release checks and upgrade notices. For example, set to `1` in automation that requires quiet stderr. |
 
 ```sh
 # Force the light palette for one command

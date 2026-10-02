@@ -12,6 +12,37 @@ gh extension install github/gh-stack
 
 Requires the [GitHub CLI](https://cli.github.com/) (`gh`) v2.0+ and Git 2.36+.
 
+### Updating
+
+```sh
+gh extension upgrade stack
+```
+
+Official, unpinned stable release installations check for a newer
+[latest release](https://github.com/github/gh-stack/releases/latest) in the
+background, caching successful checks for 24 hours. When an update is available,
+commands can append an upgrade notice to stderr after success or an operational failure,
+also at most once every 24 hours. On failure, the original error appears first
+and the exit code is unchanged. This includes non-interactive use; stdout and
+JSON output are unchanged.
+The check and reminder timestamps are shared across repositories for your user.
+They are stored as YAML in `gh-stack/state.yml` beneath GitHub CLI's state
+directory (`~/.local/state/gh` by default on macOS/Linux).
+
+Commands never wait for a release check. Short commands may finish before a
+notice is ready. Failed or interrupted attempts can retry after a 15-minute
+cooldown instead of waiting a full day. Completed checks are cached so a later
+command can show the notice.
+No upgrades happen automatically, and development, locally linked, prerelease,
+and pinned installations are excluded. Help, version, and completion commands
+do not run the notifier.
+Usage errors and explicit user cancellations do not show upgrade notices.
+
+Set `GH_STACK_NO_UPDATE_NOTIFIER=1` to disable these checks and notices, including
+in CI or scripts. Any non-empty value disables the notifier. Optional check
+failures do not affect command exit codes; set `GH_DEBUG=1` for diagnostics.
+Install a release containing this feature to receive notices for future releases.
+
 ## AI agent integration
 
 Install the gh-stack skill so your AI coding agent knows how to work with stacked PRs and the `gh stack` CLI:

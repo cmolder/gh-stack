@@ -1,18 +1,32 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 
 	"github.com/github/gh-stack/internal/config"
 	"github.com/github/gh-stack/internal/theme"
+	"github.com/github/gh-stack/internal/update"
 	"github.com/spf13/cobra"
 )
 
-func RootCmd() *cobra.Command {
-	cfg := config.New()
+type updateResult struct {
+	notify update.Notification
+	err    error
+}
 
+type rootCommand struct {
+	*cobra.Command
+	finish func(error)
+}
+
+func RootCmd() *cobra.Command {
+	return newRootCmd(config.New(), startUpdateCheck).Command
+}
+
+func newRootCmd(cfg *config.Config, startCheck func(context.Context, string) <-chan updateResult) *rootCommand {
 	root := &cobra.Command{
 		Use:   "stack <command>",
 		Short: "Manage stacked branches and pull requests",
@@ -36,10 +50,35 @@ locally, then push to GitHub to create your stack of PRs.`,
 		Version:       Version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
-		// Honor GH_STACK_THEME (auto|light|dark) before any command renders
-		PersistentPreRun: func(_ *cobra.Command, _ []string) {
-			theme.ApplyOverride()
-		},
+	}
+
+	var updates <-chan updateResult
+	root.PersistentPreRun = func(cmd *cobra.Command, _ []string) {
+		theme.ApplyOverride()
+		cfg.Canceled = false
+		updates = nil
+		if update.Enabled(root.Version) && !isHelpOrCompletionCommand(cmd) {
+			updates = startCheck(cmd.Context(), root.Version)
+		}
+	}
+	finish := func(err error) {
+		results := updates
+		updates = nil
+		if cfg.Canceled || errors.Is(err, ErrInvalidArgs) ||
+			errors.Is(err, context.Canceled) || errors.Is(err, errInterrupt) || isInterruptError(err) {
+			return
+		}
+		select {
+		case result := <-results:
+			if result.notify != nil {
+				result.err = errors.Join(result.err, result.notify(root.ErrOrStderr()))
+			}
+			if result.err != nil && os.Getenv("GH_DEBUG") != "" {
+				fmt.Fprintf(root.ErrOrStderr(), "debug: gh-stack update notification: %v\n", result.err)
+			}
+		default:
+			// Never wait for a release check if the command finishes quickly
+		}
 	}
 
 	root.SetVersionTemplate("gh stack version {{.Version}}\n")
@@ -150,23 +189,52 @@ locally, then push to GitHub to create your stack of PRs.`,
 	feedbackCmd.GroupID = "utils"
 	root.AddCommand(feedbackCmd)
 
-	return root
+	return &rootCommand{Command: root, finish: finish}
 }
 
-func Execute() {
-	cmd := RootCmd()
+func startUpdateCheck(ctx context.Context, version string) <-chan updateResult {
+	results := make(chan updateResult, 1)
+	go func() {
+		notify, err := update.Check(ctx, version)
+		results <- updateResult{notify: notify, err: err}
+	}()
+	return results
+}
+
+func isHelpOrCompletionCommand(cmd *cobra.Command) bool {
+	for c := cmd; c != nil; c = c.Parent() {
+		switch c.Name() {
+		case "help", "completion", cobra.ShellCompRequestCmd, cobra.ShellCompNoDescRequestCmd:
+			return true
+		}
+	}
+	return false
+}
+
+func execute(cmd *rootCommand, args []string) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// Wrap in a "gh" parent so help output shows "gh stack" instead of just "stack".
 	wrapCmd := &cobra.Command{Use: "gh", SilenceUsage: true, SilenceErrors: true}
-	wrapCmd.AddCommand(cmd)
-	wrapCmd.SetArgs(append([]string{"stack"}, os.Args[1:]...))
+	wrapCmd.AddCommand(cmd.Command)
+	wrapCmd.SetArgs(append([]string{"stack"}, args...))
+	err := wrapCmd.ExecuteContext(ctx)
+	var exitErr *ExitError
+	if err != nil && !errors.As(err, &exitErr) {
+		fmt.Fprintln(cmd.ErrOrStderr(), err)
+	}
+	cmd.finish(err)
+	return err
+}
 
-	if err := wrapCmd.Execute(); err != nil {
+func Execute() {
+	cmd := newRootCmd(config.New(), startUpdateCheck)
+	if err := execute(cmd, os.Args[1:]); err != nil {
 		var exitErr *ExitError
 		if errors.As(err, &exitErr) {
 			os.Exit(exitErr.Code)
 		}
-		fmt.Fprintln(cmd.ErrOrStderr(), err)
 		os.Exit(1)
 	}
 }
