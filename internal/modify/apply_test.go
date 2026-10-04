@@ -55,6 +55,9 @@ func newApplyMock(gitDir string, branchSHAs map[string]string) *git.MockOps {
 			if sha, ok := branchSHAs[ref]; ok {
 				return sha, nil
 			}
+			if sha, ok := branchSHAs[strings.TrimPrefix(ref, "refs/heads/")]; ok {
+				return sha, nil
+			}
 			return "sha-" + ref, nil
 		},
 		IsAncestorFn:         func(a, d string) (bool, error) { return false, nil },
@@ -444,8 +447,9 @@ func TestBuildSnapshot(t *testing.T) {
 		"B": "sha-bbb",
 	}
 	mock := &git.MockOps{
+		BranchExistsFn: func(string) (bool, error) { return true, nil },
 		RevParseFn: func(ref string) (string, error) {
-			if sha, ok := branchSHAs[ref]; ok {
+			if sha, ok := branchSHAs[strings.TrimPrefix(ref, "refs/heads/")]; ok {
 				return sha, nil
 			}
 			return "sha-" + ref, nil
@@ -472,6 +476,158 @@ func TestBuildSnapshot(t *testing.T) {
 	assert.Equal(t, "main", restored.Trunk.Branch)
 	assert.Equal(t, "A", restored.Branches[0].Branch)
 	assert.Equal(t, "B", restored.Branches[1].Branch)
+}
+
+func TestBuildSnapshot_SkipsPrunedMergedBranchesWithoutRevivingThem(t *testing.T) {
+	s := stack.Stack{
+		Trunk: stack.BranchRef{Branch: "main"},
+		Branches: []stack.BranchRef{
+			{
+				Branch: "merged-pruned",
+				Head:   "sha-merged",
+				PullRequest: &stack.PullRequestRef{
+					Number: 1,
+					Merged: true,
+				},
+			},
+			{Branch: "active"},
+		},
+	}
+
+	var resolvedRefs []string
+	snapshotMock := &git.MockOps{
+		BranchExistsFn: func(name string) (bool, error) {
+			return name != "merged-pruned", nil
+		},
+		RevParseMultiFn: func(refs []string) ([]string, error) {
+			resolvedRefs = append(resolvedRefs, refs...)
+			for _, ref := range refs {
+				if ref == "refs/heads/merged-pruned" {
+					return nil, errors.New("unknown revision")
+				}
+			}
+			return []string{"sha-active"}, nil
+		},
+	}
+	snapshot, err := func() (Snapshot, error) {
+		restore := git.SetOps(snapshotMock)
+		defer restore()
+		return BuildSnapshot(&s)
+	}()
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"refs/heads/active"}, resolvedRefs)
+	require.Len(t, snapshot.Branches, 1)
+	assert.Equal(t, "active", snapshot.Branches[0].Name)
+	assert.Equal(t, "sha-active", snapshot.Branches[0].TipSHA)
+	assert.Equal(t, 1, snapshot.Branches[0].Position)
+
+	// Keep the complete stack metadata so abort can restore the logical stack,
+	// but do not include the pruned branch in the tip snapshot. Otherwise
+	// Unwind would recreate a branch the user intentionally deleted.
+	var restoredStack stack.Stack
+	require.NoError(t, json.Unmarshal(snapshot.StackMetadata, &restoredStack))
+	require.Len(t, restoredStack.Branches, 2)
+	assert.True(t, restoredStack.Branches[0].IsMerged())
+
+	gitDir := t.TempDir()
+	sf := writeTestStackFile(t, gitDir, s)
+	stateFile := &StateFile{
+		SchemaVersion: 1,
+		StackName:     "main",
+		StackIndex:    0,
+		Phase:         PhaseApplying,
+		Snapshot:      snapshot,
+	}
+	require.NoError(t, SaveState(gitDir, stateFile))
+	sf.Stacks[0].Branches = []stack.BranchRef{{Branch: "active"}}
+	stateFile.RecordStack(&sf.Stacks[0])
+	require.NoError(t, SaveState(gitDir, stateFile))
+	var createdBranches []string
+	unwindMock := &git.MockOps{
+		GitDirFn:             func() (string, error) { return gitDir, nil },
+		IsRebaseInProgressFn: func() (bool, error) { return false, nil },
+		BranchExistsFn: func(name string) (bool, error) {
+			return name == "active", nil
+		},
+		CheckoutBranchFn: func(string) error { return nil },
+		ResetHardFn:      func(string) error { return nil },
+		CreateBranchFn: func(name, _ string) error {
+			createdBranches = append(createdBranches, name)
+			return nil
+		},
+	}
+	restore := git.SetOps(unwindMock)
+	defer restore()
+
+	cfg, _, _ := config.NewTestConfig()
+	defer cfg.Out.Close()
+	defer cfg.Err.Close()
+
+	require.NoError(t, Unwind(cfg, gitDir, snapshot, 0, sf, nil))
+	assert.Empty(t, createdBranches)
+	require.Len(t, sf.Stacks[0].Branches, 2)
+	assert.Equal(t, "merged-pruned", sf.Stacks[0].Branches[0].Branch)
+}
+
+func TestBuildSnapshot_MissingUnmergedBranchStillFails(t *testing.T) {
+	s := stack.Stack{
+		Trunk: stack.BranchRef{Branch: "main"},
+		Branches: []stack.BranchRef{
+			{Branch: "missing-active"},
+		},
+	}
+
+	var revParseCalled bool
+	mock := &git.MockOps{
+		BranchExistsFn: func(string) (bool, error) { return false, nil },
+		RevParseMultiFn: func(refs []string) ([]string, error) {
+			revParseCalled = true
+			// Model a same-named tag: resolving the ambiguous short name would
+			// succeed even though the local branch itself is missing.
+			return []string{"sha-from-tag"}, nil
+		},
+	}
+	restore := git.SetOps(mock)
+	defer restore()
+
+	_, err := BuildSnapshot(&s)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "resolving branch SHAs")
+	assert.False(t, revParseCalled, "a missing active branch must fail before rev-parse can resolve a same-named tag")
+}
+
+func TestBuildSnapshot_IncludesMergedBranchThatStillExists(t *testing.T) {
+	s := stack.Stack{
+		Trunk: stack.BranchRef{Branch: "main"},
+		Branches: []stack.BranchRef{
+			{
+				Branch: "merged-local",
+				PullRequest: &stack.PullRequestRef{
+					Number: 1,
+					Merged: true,
+				},
+			},
+		},
+	}
+
+	mock := &git.MockOps{
+		BranchExistsFn: func(name string) (bool, error) {
+			return name == "merged-local", nil
+		},
+		RevParseMultiFn: func(refs []string) ([]string, error) {
+			assert.Equal(t, []string{"refs/heads/merged-local"}, refs)
+			return []string{"sha-merged"}, nil
+		},
+	}
+	restore := git.SetOps(mock)
+	defer restore()
+
+	snapshot, err := BuildSnapshot(&s)
+	require.NoError(t, err)
+	require.Len(t, snapshot.Branches, 1)
+	assert.Equal(t, "merged-local", snapshot.Branches[0].Name)
+	assert.Equal(t, "sha-merged", snapshot.Branches[0].TipSHA)
 }
 
 // ─── BuildPlan ───────────────────────────────────────────────────────────────
@@ -1197,8 +1353,9 @@ func TestUnwind(t *testing.T) {
 	}
 
 	snapshotMock := &git.MockOps{
+		BranchExistsFn: func(string) (bool, error) { return true, nil },
 		RevParseFn: func(ref string) (string, error) {
-			if sha, ok := branchSHAs[ref]; ok {
+			if sha, ok := branchSHAs[strings.TrimPrefix(ref, "refs/heads/")]; ok {
 				return sha, nil
 			}
 			return "sha-" + ref, nil
@@ -1515,7 +1672,10 @@ func TestUnwind_AbortsActiveRebase(t *testing.T) {
 	sf := writeTestStackFile(t, gitDir, s)
 
 	snapshotMock := &git.MockOps{
-		RevParseFn: func(ref string) (string, error) { return "sha-" + ref, nil },
+		BranchExistsFn: func(string) (bool, error) { return true, nil },
+		RevParseFn: func(ref string) (string, error) {
+			return "sha-" + strings.TrimPrefix(ref, "refs/heads/"), nil
+		},
 	}
 	restore := git.SetOps(snapshotMock)
 	snapshot, err := BuildSnapshot(&s)
@@ -1572,7 +1732,10 @@ func TestUnwind_AbortsActiveCherryPick(t *testing.T) {
 	sf := writeTestStackFile(t, gitDir, s)
 
 	snapshotMock := &git.MockOps{
-		RevParseFn: func(ref string) (string, error) { return "sha-" + ref, nil },
+		BranchExistsFn: func(string) (bool, error) { return true, nil },
+		RevParseFn: func(ref string) (string, error) {
+			return "sha-" + strings.TrimPrefix(ref, "refs/heads/"), nil
+		},
 	}
 	restore := git.SetOps(snapshotMock)
 	snapshot, err := BuildSnapshot(&s)
@@ -1873,7 +2036,10 @@ func TestUnwind_RestoresRenamedBranch(t *testing.T) {
 	sf := writeTestStackFile(t, gitDir, s)
 
 	snapshotMock := &git.MockOps{
-		RevParseFn: func(ref string) (string, error) { return "sha-" + ref, nil },
+		BranchExistsFn: func(string) (bool, error) { return true, nil },
+		RevParseFn: func(ref string) (string, error) {
+			return "sha-" + strings.TrimPrefix(ref, "refs/heads/"), nil
+		},
 	}
 	restore := git.SetOps(snapshotMock)
 	snapshot, err := BuildSnapshot(&s)

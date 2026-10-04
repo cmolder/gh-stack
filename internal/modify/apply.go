@@ -15,26 +15,37 @@ import (
 
 // BuildSnapshot captures the current state of the stack for unwind/recovery.
 func BuildSnapshot(s *stack.Stack) (Snapshot, error) {
-	// Collect all branch names
-	names := make([]string, len(s.Branches))
+	// Merged branches may have been pruned locally after landing. Exclude
+	// those from the tip snapshot so unwind does not recreate branches the
+	// user intentionally deleted. Missing active branches remain an error.
+	refs := make([]string, 0, len(s.Branches))
+	branches := make([]BranchSnapshot, 0, len(s.Branches))
 	for i, b := range s.Branches {
-		names[i] = b.Branch
+		exists, err := git.BranchExists(b.Branch)
+		if err != nil {
+			return Snapshot{}, fmt.Errorf("checking branch %s: %w", b.Branch, err)
+		}
+		if !exists {
+			if b.IsMerged() {
+				continue
+			}
+			return Snapshot{}, fmt.Errorf("resolving branch SHAs: local branch %q does not exist", b.Branch)
+		}
+		refs = append(refs, "refs/heads/"+b.Branch)
+		branches = append(branches, BranchSnapshot{
+			Name:     b.Branch,
+			Position: i,
+		})
 	}
 
 	// Resolve all SHAs
-	shaMap, err := git.RevParseMap(names)
+	shas, err := git.RevParseMulti(refs)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("resolving branch SHAs: %w", err)
 	}
 
-	// Build branch snapshots
-	branches := make([]BranchSnapshot, len(s.Branches))
-	for i, b := range s.Branches {
-		branches[i] = BranchSnapshot{
-			Name:     b.Branch,
-			TipSHA:   shaMap[b.Branch],
-			Position: i,
-		}
+	for i := range branches {
+		branches[i].TipSHA = shas[i]
 	}
 
 	// Serialize stack metadata

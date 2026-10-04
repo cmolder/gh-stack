@@ -432,8 +432,9 @@ func TestCheckNoModifyInProgress(t *testing.T) {
 
 func TestBuildModifySnapshot(t *testing.T) {
 	mock := &git.MockOps{
+		BranchExistsFn: func(string) (bool, error) { return true, nil },
 		RevParseFn: func(ref string) (string, error) {
-			return "sha-" + ref, nil
+			return "sha-" + strings.TrimPrefix(ref, "refs/heads/"), nil
 		},
 	}
 	restore := git.SetOps(mock)
@@ -1186,7 +1187,9 @@ func TestModifyApply_DoesNotReportAdministrationDirectoryAsOwner(t *testing.T) {
 		RootDirFn:       func() (string, error) { return origin, nil },
 		CurrentBranchFn: func() (string, error) { return "B", nil },
 		BranchExistsFn:  func(string) (bool, error) { return true, nil },
-		RevParseFn:      func(ref string) (string, error) { return "sha-" + ref, nil },
+		RevParseFn: func(ref string) (string, error) {
+			return "sha-" + strings.TrimPrefix(ref, "refs/heads/"), nil
+		},
 		WorktreesFn: func() ([]git.Worktree, error) {
 			return []git.Worktree{{Path: dir, Branch: "A"}, {Path: origin, Branch: "B"}}, nil
 		},
