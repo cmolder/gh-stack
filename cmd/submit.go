@@ -729,7 +729,7 @@ func handlePendingModify(cfg *config.Config, client github.ClientOps, s *stack.S
 		}
 		if !found {
 			cfg.Printf("Previous stack already deleted on GitHub")
-		} else if _, dissolved, err := client.Unstack(number); err != nil {
+		} else if remaining, dissolved, err := client.Unstack(number); err != nil {
 			var httpErr *api.HTTPError
 			if errors.As(err, &httpErr) && httpErr.StatusCode == 404 {
 				cfg.Printf("Previous stack already deleted on GitHub")
@@ -739,8 +739,13 @@ func handlePendingModify(cfg *config.Config, client github.ClientOps, s *stack.S
 				return true, err
 			}
 		} else if !dissolved {
-			cfg.Errorf("the previous stack still has pull requests queued for merge or with auto-merge enabled; it cannot be recreated yet")
-			return true, ErrConflict
+			// GitHub never removes merged PRs from a stack, so they remain as
+			// history once every open PR has been released.
+			if !onlyMergedPRsRemain(remaining) {
+				cfg.Errorf("the previous stack still has pull requests queued for merge or with auto-merge enabled; it cannot be recreated yet")
+				return true, ErrConflict
+			}
+			cfg.Successf("Released open pull requests from the previous stack on GitHub")
 		} else {
 			cfg.Successf("Cleared existing stack on GitHub")
 		}
@@ -757,6 +762,20 @@ func handlePendingModify(cfg *config.Config, client github.ClientOps, s *stack.S
 	s.Number = 0
 
 	return true, nil
+}
+
+// onlyMergedPRsRemain reports whether an unstack left behind a stack that
+// holds nothing but merged pull requests.
+func onlyMergedPRsRemain(remaining *github.RemoteStack) bool {
+	if remaining == nil || len(remaining.PRDetails) == 0 {
+		return false
+	}
+	for _, pr := range remaining.PRDetails {
+		if !pr.IsMerged() {
+			return false
+		}
+	}
+	return true
 }
 
 // clearPendingModifyState clears the modify state file after a successful submit.
