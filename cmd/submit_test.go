@@ -2151,6 +2151,66 @@ func TestPendingModify_PartialUnstackPreservesState(t *testing.T) {
 	commandOutput(t, cfg, outR, errR)
 }
 
+func TestPendingModify_OnlyMergedPRsRemainProceeds(t *testing.T) {
+	dir := t.TempDir()
+	saveModifyState(t, dir, newPendingSubmitState("123"))
+	s := &stack.Stack{ID: "123", Number: 7}
+	cfg, outR, errR := config.NewTestConfig()
+	mergedAt := "2026-10-03T02:03:39Z"
+	client := &github.MockClient{
+		ListStacksFn: func() ([]github.RemoteStack, error) {
+			return []github.RemoteStack{{ID: 123, Number: 7}}, nil
+		},
+		UnstackFn: func(int) (*github.RemoteStack, bool, error) {
+			return &github.RemoteStack{
+				ID: 123, Number: 7,
+				PRDetails: []github.RemoteStackPR{{Number: 1, State: "closed", MergedAt: &mergedAt}},
+			}, false, nil
+		},
+	}
+	handled, err := handlePendingModify(cfg, client, s, dir)
+	require.NoError(t, err)
+	assert.True(t, handled)
+	assert.Empty(t, s.ID)
+	assert.Zero(t, s.Number)
+	state, err := modify.LoadState(dir)
+	require.NoError(t, err)
+	require.NotNil(t, state)
+	assert.Empty(t, state.PriorRemoteStackID)
+	commandOutput(t, cfg, outR, errR)
+}
+
+func TestPendingModify_OpenPRRemainsPreservesState(t *testing.T) {
+	dir := t.TempDir()
+	saveModifyState(t, dir, newPendingSubmitState("123"))
+	s := &stack.Stack{ID: "123", Number: 7}
+	cfg, outR, errR := config.NewTestConfig()
+	mergedAt := "2026-10-03T02:03:39Z"
+	client := &github.MockClient{
+		ListStacksFn: func() ([]github.RemoteStack, error) {
+			return []github.RemoteStack{{ID: 123, Number: 7}}, nil
+		},
+		UnstackFn: func(int) (*github.RemoteStack, bool, error) {
+			return &github.RemoteStack{
+				ID: 123, Number: 7,
+				PRDetails: []github.RemoteStackPR{
+					{Number: 1, State: "closed", MergedAt: &mergedAt},
+					{Number: 2, State: "open"},
+				},
+			}, false, nil
+		},
+	}
+	handled, err := handlePendingModify(cfg, client, s, dir)
+	assert.ErrorIs(t, err, ErrConflict)
+	assert.True(t, handled)
+	assert.Equal(t, "123", s.ID)
+	state, err := modify.LoadState(dir)
+	require.NoError(t, err)
+	require.NotNil(t, state)
+	assert.Equal(t, "123", state.PriorRemoteStackID)
+	commandOutput(t, cfg, outR, errR)
+}
+
 func TestSubmit_UnrelatedPendingModifyIsPreserved(t *testing.T) {
 	dir := t.TempDir()
 	s := stack.Stack{
