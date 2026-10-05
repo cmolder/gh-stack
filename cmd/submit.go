@@ -288,7 +288,7 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 			cfg.Printf("Finish submitting all remaining PRs, then retry `%s`", cfg.ColorCyan("gh stack submit"))
 			return ErrSilent
 		}
-		if err := clearPendingModifyState(cfg, s, gitDir); err != nil {
+		if err := clearPendingModifyState(cfg, gitDir); err != nil {
 			return err
 		}
 	}
@@ -779,14 +779,17 @@ func onlyMergedPRsRemain(remaining *github.RemoteStack) bool {
 }
 
 // clearPendingModifyState clears the modify state file after a successful submit.
-// The caller must verify all required PR updates and save the catalog first.
-func clearPendingModifyState(cfg *config.Config, s *stack.Stack, gitDir string) error {
+// The caller must verify all required PR updates and save the catalog first,
+// and must only call it for a modification that handlePendingModify matched.
+// It cannot match again here because syncStack has since replaced the stack ID
+// that the journal's prior remote stack ID was matched against.
+func clearPendingModifyState(cfg *config.Config, gitDir string) error {
 	state, err := modify.LoadState(gitDir)
 	if err != nil {
 		cfg.Errorf("reading modify recovery state: %s", err)
 		return ErrModifyRecovery
 	}
-	if state == nil || state.Phase != modify.PhasePendingSubmit || !modify.MatchesStack(state, s) {
+	if state == nil || state.Phase != modify.PhasePendingSubmit {
 		return nil
 	}
 	if err := modify.ClearState(gitDir); err != nil {

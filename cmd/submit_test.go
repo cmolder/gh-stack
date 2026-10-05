@@ -2080,7 +2080,6 @@ func TestPendingModify_UnrelatedStackRemainsUntouched(t *testing.T) {
 	handled, err := handlePendingModify(cfg, client, s, dir)
 	require.NoError(t, err)
 	assert.False(t, handled)
-	require.NoError(t, clearPendingModifyState(cfg, s, dir))
 	after, err := modify.LoadState(dir)
 	require.NoError(t, err)
 	assert.Equal(t, pending, after)
@@ -2098,7 +2097,7 @@ func TestPendingModify_CorruptStateFailsClosed(t *testing.T) {
 	handled, err := handlePendingModify(cfg, &github.MockClient{}, s, dir)
 	assert.ErrorIs(t, err, ErrModifyRecovery)
 	assert.False(t, handled)
-	assert.ErrorIs(t, clearPendingModifyState(cfg, s, dir), ErrModifyRecovery)
+	assert.ErrorIs(t, clearPendingModifyState(cfg, dir), ErrModifyRecovery)
 	assert.FileExists(t, modify.StatePath(dir))
 	out, _ := commandOutput(t, cfg, outR, errR)
 	assert.Empty(t, out)
@@ -2123,7 +2122,7 @@ func TestPendingModify_RetryAfterOldStackDeletion(t *testing.T) {
 	assert.Empty(t, s.ID, "the catalog can still hold the old ID on a retry")
 	assert.Zero(t, s.Number)
 	s.ID, s.Number = "456", 8
-	require.NoError(t, clearPendingModifyState(cfg, s, dir))
+	require.NoError(t, clearPendingModifyState(cfg, dir))
 	assert.NoFileExists(t, modify.StatePath(dir))
 	commandOutput(t, cfg, outR, errR)
 }
@@ -2414,8 +2413,38 @@ func TestClearPendingModifyState_ClearsFile(t *testing.T) {
 	defer cfg.Out.Close()
 	defer cfg.Err.Close()
 
-	require.NoError(t, clearPendingModifyState(cfg, &stack.Stack{ID: "stack-789"}, gitDir))
+	require.NoError(t, clearPendingModifyState(cfg, gitDir))
 	assert.False(t, modify.StateExists(gitDir), "state file should be removed")
+}
+
+// A recreated stack has a new ID that differs from the prior remote stack ID
+// recorded in the journal, and the journal can list merged branches that the
+// catalog no longer holds. Neither may keep the journal alive after submit.
+func TestPendingModify_ClearedAfterStackRecreatedWithNewID(t *testing.T) {
+	dir := t.TempDir()
+	state := newPendingSubmitState("123")
+	state.StackName = "main"
+	state.StackBranches = []string{"merged", "b1", "b2"}
+	saveModifyState(t, dir, state)
+	s := &stack.Stack{
+		ID: "123", Number: 7,
+		Trunk:    stack.BranchRef{Branch: "main"},
+		Branches: []stack.BranchRef{{Branch: "b1"}, {Branch: "b2"}},
+	}
+	cfg, outR, errR := config.NewTestConfig()
+	client := &github.MockClient{
+		ListStacksFn: func() ([]github.RemoteStack, error) {
+			return []github.RemoteStack{{ID: 123, Number: 7}}, nil
+		},
+		UnstackFn: func(int) (*github.RemoteStack, bool, error) { return nil, true, nil },
+	}
+	handled, err := handlePendingModify(cfg, client, s, dir)
+	require.NoError(t, err)
+	require.True(t, handled)
+	s.ID, s.Number = "456", 8 // assigned by syncStack
+	require.NoError(t, clearPendingModifyState(cfg, dir))
+	assert.NoFileExists(t, modify.StatePath(dir))
+	commandOutput(t, cfg, outR, errR)
 }
 
 func TestClearPendingModifyState_NoFile(t *testing.T) {
@@ -2427,7 +2456,7 @@ func TestClearPendingModifyState_NoFile(t *testing.T) {
 	defer cfg.Err.Close()
 
 	// Should not panic or error.
-	require.NoError(t, clearPendingModifyState(cfg, &stack.Stack{}, gitDir))
+	require.NoError(t, clearPendingModifyState(cfg, gitDir))
 	assert.False(t, modify.StateExists(gitDir))
 }
 
