@@ -146,7 +146,7 @@ func MatchesStack(state *StateFile, target *stack.Stack) bool {
 		if state.StackName != target.Trunk.Branch {
 			return false
 		}
-		if slices.Equal(state.StackBranches, target.BranchNames()) {
+		if sameBranchesAboveMerged(state.StackBranches, target.BranchNames()) {
 			return true
 		}
 		// The journal is published before the catalog. An interrupted save
@@ -191,6 +191,18 @@ func MatchesStack(state *StateFile, target *stack.Stack) bool {
 		}
 	}
 	return slices.Equal(names, target.BranchNames())
+}
+
+// sameBranchesAboveMerged reports whether current is recorded, or recorded with
+// merged branches at the bottom that the catalog has since pruned. Submit
+// prunes them after the journal captured the stack, so a retry would otherwise
+// never match.
+func sameBranchesAboveMerged(recorded, current []string) bool {
+	if slices.Equal(recorded, current) {
+		return true
+	}
+	return len(current) > 0 && len(recorded) > len(current) &&
+		slices.Equal(recorded[len(recorded)-len(current):], current)
 }
 
 // ClearState removes the modify state file.

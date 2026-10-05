@@ -3010,6 +3010,14 @@ func TestMatchesStack(t *testing.T) {
 			assert.Equal(t, tt.want, MatchesStack(tt.state, &tt.target))
 		})
 	}
+	t.Run("merged bottom branches pruned from catalog", func(t *testing.T) {
+		state := &StateFile{Phase: PhasePendingSubmit}
+		state.RecordStack(&stack.Stack{Trunk: original.Trunk, Branches: []stack.BranchRef{{Branch: "merged"}, {Branch: "A"}, {Branch: "B"}}})
+		assert.True(t, MatchesStack(state, &original))
+		assert.False(t, MatchesStack(state, &stack.Stack{Trunk: original.Trunk, Branches: []stack.BranchRef{{Branch: "A"}}}),
+			"only a pruned bottom may differ")
+		assert.False(t, MatchesStack(state, &stack.Stack{Trunk: original.Trunk}))
+	})
 	t.Run("catalog publication boundary", func(t *testing.T) {
 		state := &StateFile{Phase: PhaseApplying}
 		state.RecordStack(&original)
